@@ -1,0 +1,334 @@
+name: Build CLIP Model Binaries
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.8', '3.9', '3.10', '3.11']
+        exclude:
+          # Reduce matrix size for faster builds
+          - os: macos-latest
+            python-version: '3.8'
+          - os: windows-latest
+            python-version: '3.8'
+    
+    runs-on: ${{ matrix.os }}
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install wheel setuptools
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+        pip install ftfy regex tqdm
+        pip install onnx onnxruntime
+        pip install -e .
+    
+    - name: Download CLIP models and convert to ONNX
+      run: |
+        python -c "
+        import clip
+        import torch
+        import os
+        import platform
+        
+        os.makedirs('models', exist_ok=True)
+        
+        # Available CLIP models
+        models = [
+            'RN50', 'RN101', 'RN50x4', 'RN50x16', 'RN50x64',
+            'ViT-B/32', 'ViT-B/16', 'ViT-L/14', 'ViT-L/14@336px'
+        ]
+        
+        device = 'cpu'  # Use CPU for consistent builds
+        
+        for model_name in models:
+            try:
+                print(f'Processing {model_name}...')
+                
+                # Load the model
+                model, preprocess = clip.load(model_name, device=device)
+                model.eval()
+                
+                # Create safe filename
+                safe_name = model_name.replace('/', '_').replace('@', '_')
+                
+                # Save model state dict
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'model_name': model_name,
+                    'input_resolution': model.visual.input_resolution,
+                    'context_length': model.context_length,
+                    'vocab_size': model.vocab_size
+                }, f'models/clip_{safe_name}.pth')
+                
+                print(f'Saved {model_name} as clip_{safe_name}.pth')
+                
+                # Try to export to ONNX (text encoder)
+                try:
+                    dummy_text = clip.tokenize(['hello world']).to(device)
+                    torch.onnx.export(
+                        model.encode_text,
+                        dummy_text,
+                        f'models/clip_{safe_name}_text_encoder.onnx',
+                        export_params=True,
+                        opset_version=11,
+                        do_constant_folding=True,
+                        input_names=['text'],
+                        output_names=['text_features'],
+                        dynamic_axes={
+                            'text': {0: 'batch_size'},
+                            'text_features': {0: 'batch_size'}
+                        }
+                    )
+                    print(f'Exported {model_name} text encoder to ONNX')
+                except Exception as e:
+                    print(f'Failed to export {model_name} text encoder to ONNX: {e}')
+                
+                # Try to export to ONNX (image encoder)
+                try:
+                    dummy_image = torch.randn(1, 3, model.visual.input_resolution, model.visual.input_resolution).to(device)
+                    torch.onnx.export(
+                        model.encode_image,
+                        dummy_image,
+                        f'models/clip_{safe_name}_image_encoder.onnx',
+                        export_params=True,
+                        opset_version=11,
+                        do_constant_folding=True,
+                        input_names=['image'],
+                        output_names=['image_features'],
+                        dynamic_axes={
+                            'image': {0: 'batch_size'},
+                            'image_features': {0: 'batch_size'}
+                        }
+                    )
+                    print(f'Exported {model_name} image encoder to ONNX')
+                except Exception as e:
+                    print(f'Failed to export {model_name} image encoder to ONNX: {e}')
+                    
+            except Exception as e:
+                print(f'Failed to process {model_name}: {e}')
+        
+        print('Model processing complete!')
+        "
+    
+    - name: Create model metadata
+      run: |
+        python -c "
+        import json
+        import os
+        import platform
+        from datetime import datetime
+        
+        # Create metadata for all models
+        metadata = {
+            'build_info': {
+                'platform': platform.system().lower(),
+                'architecture': platform.machine().lower(),
+                'python_version': platform.python_version(),
+                'build_date': datetime.now().isoformat()
+            },
+            'models': {
+                'RN50': {
+                    'description': 'ResNet-50 backbone, 63M parameters',
+                    'input_resolution': 224,
+                    'recommended_use': 'General purpose, good balance of speed and accuracy'
+                },
+                'RN101': {
+                    'description': 'ResNet-101 backbone, 119M parameters',
+                    'input_resolution': 224,
+                    'recommended_use': 'Higher accuracy than RN50'
+                },
+                'ViT-B/32': {
+                    'description': 'Vision Transformer Base, 32x32 patches, 151M parameters',
+                    'input_resolution': 224,
+                    'recommended_use': 'Good performance, efficient'
+                },
+                'ViT-B/16': {
+                    'description': 'Vision Transformer Base, 16x16 patches, 149M parameters',
+                    'input_resolution': 224,
+                    'recommended_use': 'Better than ViT-B/32, more compute intensive'
+                },
+                'ViT-L/14': {
+                    'description': 'Vision Transformer Large, 14x14 patches, 427M parameters',
+                    'input_resolution': 224,
+                    'recommended_use': 'High accuracy, requires more compute'
+                },
+                'ViT-L/14@336px': {
+                    'description': 'Vision Transformer Large, 14x14 patches, 336px input, 427M parameters',
+                    'input_resolution': 336,
+                    'recommended_use': 'Highest accuracy, most compute intensive'
+                }
+            },
+            'usage': {
+                'pytorch': 'Load with torch.load() and clip.load()',
+                'onnx': 'Use with onnxruntime for inference',
+                'preprocessing': 'Use clip.tokenize() for text, standard image preprocessing for images'
+            }
+        }
+        
+        with open('models/metadata.json', 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        print('Created model metadata')
+        "
+    
+    - name: Create binary package
+      run: |
+        python -c "
+        import os
+        import shutil
+        import platform
+        
+        # Create binary package directory
+        os_name = platform.system().lower()
+        arch = platform.machine().lower()
+        package_name = f'clip-models-{os_name}-{arch}'
+        
+        os.makedirs(package_name, exist_ok=True)
+        
+        # Copy model files
+        if os.path.exists('models'):
+            shutil.copytree('models', f'{package_name}/models', dirs_exist_ok=True)
+            print('Packaged model files')
+        
+        # Copy CLIP source code
+        for item in ['clip', 'setup.py', 'README.md']:
+            if os.path.exists(item):
+                if os.path.isdir(item):
+                    shutil.copytree(item, f'{package_name}/{item}', dirs_exist_ok=True)
+                else:
+                    shutil.copy2(item, f'{package_name}/{item}')
+                print(f'Packaged {item}')
+        
+        # Create version info
+        with open(f'{package_name}/VERSION.txt', 'w') as f:
+            f.write('CLIP Models Package\n')
+            f.write(f'Platform: {os_name}-{arch}\n')
+            f.write(f'Build Date: {__import__("datetime").datetime.now().isoformat()}\n')
+            f.write('Models: Multiple CLIP variants (ResNet and Vision Transformer)\n')
+        
+        # Create usage instructions
+        with open(f'{package_name}/USAGE.md', 'w') as f:
+            f.write('# CLIP Models Usage\n\n')
+            f.write('## Installation\n')
+            f.write('```bash\n')
+            f.write('pip install torch torchvision\n')
+            f.write('pip install ftfy regex tqdm\n')
+            f.write('pip install git+https://github.com/openai/CLIP.git\n')
+            f.write('```\n\n')
+            f.write('## PyTorch Usage\n')
+            f.write('```python\n')
+            f.write('import clip\n')
+            f.write('import torch\n')
+            f.write('\n')
+            f.write('device = "cuda" if torch.cuda.is_available() else "cpu"\n')
+            f.write('model, preprocess = clip.load("ViT-B/32", device=device)\n')
+            f.write('```\n\n')
+            f.write('## ONNX Usage\n')
+            f.write('```python\n')
+            f.write('import onnxruntime as ort\n')
+            f.write('\n')
+            f.write('# Load ONNX model\n')
+            f.write('session = ort.InferenceSession("models/clip_ViT-B_32_image_encoder.onnx")\n')
+            f.write('```\n')
+        "
+    
+    - name: Archive binaries
+      uses: actions/upload-artifact@v3
+      with:
+        name: clip-models-${{ runner.os }}-${{ runner.arch }}-py${{ matrix.python-version }}
+        path: clip-models-*
+        retention-days: 30
+    
+    - name: Create Release Archive
+      if: startsWith(github.ref, 'refs/tags/')
+      run: |
+        python -c "
+        import os
+        import shutil
+        import platform
+        
+        os_name = platform.system().lower()
+        arch = platform.machine().lower()
+        package_name = f'clip-models-{os_name}-{arch}'
+        
+        if os.path.exists(package_name):
+            shutil.make_archive(package_name, 'zip', package_name)
+            print(f'Created {package_name}.zip')
+        "
+    
+    - name: Upload Release Asset
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ github.event.release.upload_url }}
+        asset_path: ./clip-models-*.zip
+        asset_name: clip-models-${{ runner.os }}-${{ runner.arch }}.zip
+        asset_content_type: application/zip
+
+  create-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: CLIP Models ${{ github.ref }}
+        body: |
+          ## CLIP Model Binaries
+          
+          This release contains pre-built CLIP models for vision-language understanding.
+          
+          ### Available Models:
+          - **ResNet variants**: RN50, RN101, RN50x4, RN50x16, RN50x64
+          - **Vision Transformer variants**: ViT-B/32, ViT-B/16, ViT-L/14, ViT-L/14@336px
+          
+          ### Model Formats:
+          - PyTorch (.pth) - Full model state dictionaries
+          - ONNX (.onnx) - Separate image and text encoders for inference
+          
+          ### Supported Platforms:
+          - Windows (x64)
+          - macOS (x64, ARM64)
+          - Linux (x64)
+          
+          ### Usage:
+          Download the appropriate binary package for your platform and follow the USAGE.md instructions.
+          Supports both PyTorch and ONNX Runtime inference.
+        draft: false
+        prerelease: false
